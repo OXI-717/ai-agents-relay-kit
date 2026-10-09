@@ -111,6 +111,12 @@ case "${1:-}" in
     ln -sfn "$(readlink "$PREV")" "$CUR"
     run_container "$(readlink "$CUR")"
     ;;
+  collect)  # run vpn-agent once before a managed xray restart (spec §7.1);
+            # best-effort: the agent may not exist on stage-1 hosts
+    if [[ -x /usr/local/bin/vpn-agent && -f /etc/vpn-agent/agent.json ]]; then
+      runuser -u vpn-agent -- /usr/local/bin/vpn-agent -config /etc/vpn-agent/agent.json || true
+    fi
+    ;;
   status)
     echo "current=$(basename "$(readlink "$CUR" 2>/dev/null || echo none)")"
     echo "previous=$(basename "$(readlink "$PREV" 2>/dev/null || echo none)")"
@@ -124,5 +130,5 @@ case "${1:-}" in
       -print | sort | awk '{a[NR]=$0} END {for (i = 1; i <= NR - 5; i++) print a[i]}' |
       while IFS= read -r d; do rm -rf "$d"; done
     ;;
-  *) die "usage: install|test|activate <id> | rollback | stop | seal <id> | status | prune" ;;
+  *) die "usage: install|test|activate <id> | rollback | stop | seal <id> | status | prune | collect" ;;
 esac

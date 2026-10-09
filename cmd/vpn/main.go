@@ -11,10 +11,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OXI-717/ai-agents-relay-kit/internal/backup"
 	"github.com/OXI-717/ai-agents-relay-kit/internal/build"
 	"github.com/OXI-717/ai-agents-relay-kit/internal/cf"
 	"github.com/OXI-717/ai-agents-relay-kit/internal/deploy"
 	"github.com/OXI-717/ai-agents-relay-kit/internal/external"
+	"github.com/OXI-717/ai-agents-relay-kit/internal/gen"
 	geopins "github.com/OXI-717/ai-agents-relay-kit/internal/geo"
 	"github.com/OXI-717/ai-agents-relay-kit/internal/keychain"
 	"github.com/OXI-717/ai-agents-relay-kit/internal/mask"
@@ -156,14 +158,72 @@ func deploySubs(ctx context.Context, r *registry.Registry) {
 	fmt.Printf("  ✓ subscriptions: %d written, %d deleted\n", w, d)
 }
 
+// bootstrapAgent generates the ingest HMAC key (first run), stores it in sops,
+// builds a static linux binary and installs agent + systemd timer on the host.
+func bootstrapAgent(ctx context.Context, r *registry.Registry, s registry.Server) error {
+	sec := r.Secrets.Servers[s.ID]
+	if sec.IngestKey == "" {
+		k, err := gen.HMACKey()
+		if err != nil {
+			return err
+		}
+		sec.IngestKey = k
+		r.Secrets.Servers[s.ID] = sec
+		saveAll(r)
+		fmt.Printf("%s: new ingest_key (%s) — запусти vpn deploy worker-secrets\n", s.ID, mask.Secret(k))
+	}
+	tmp, err := os.MkdirTemp("", "vpn-agent-build-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	bin := filepath.Join(tmp, "vpn-agent")
+	c := exec.Command("go", "build", "-trimpath", "-ldflags=-s -w", "-o", bin, "./cmd/vpn-agent")
+	c.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0")
+	if out, err := c.CombinedOutput(); err != nil {
+		return fmt.Errorf("build agent: %v: %s", err, out)
+	}
+	agentBin, err := os.ReadFile(bin)
+	if err != nil {
+		return err
+	}
+	svc, err := os.ReadFile("deploy/vpn-agent.service")
+	if err != nil {
+		return err
+	}
+	tmr, err := os.ReadFile("deploy/vpn-agent.timer")
+	if err != nil {
+		return err
+	}
+	supSvc, err := os.ReadFile("deploy/vpn-supervisor.service")
+	if err != nil {
+		return err
+	}
+	supTmr, err := os.ReadFile("deploy/vpn-supervisor.timer")
+	if err != nil {
+		return err
+	}
+	conf := deploy.AgentConfig(s, r.Cloudflare.SubBaseURL)
+	return deploy.BootstrapAgent(ctx, runner(r), s, agentBin, conf, []byte(sec.IngestKey+"\n"), svc, tmr, supSvc, supTmr)
+}
+
 func main() {
 	regDir := flag.String("registry", "registry", "registry directory")
 	only := flag.String("server", "", "only this server")
 	force := flag.Bool("force", false, "overwrite existing keys")
 	load := flag.Int("load", 0, "verify: parallel requests + 20MB download")
+	soak := flag.String("soak", "", "doctor: длительный тест (напр. 2m / 10m) — один туннель на сервер, держится и гоняет трафик")
 	fromClip := flag.Bool("from-clipboard", false, "import: read pbpaste")
 	geo := flag.Bool("geo", false, "validate: also download geo files and verify pins")
 	flag.Parse()
+	var soakDur time.Duration
+	if *soak != "" {
+		d, err := time.ParseDuration(*soak)
+		if err != nil || d < time.Minute {
+			die("-soak: нужна длительность ≥1m (например 2m, 10m)")
+		}
+		soakDur = d
+	}
 	a := flag.Args()
 	if len(a) == 0 {
 		die("usage: vpn [--registry dir] validate|server|uuids|user|import|deploy|verify ...")
@@ -179,6 +239,97 @@ func main() {
 	r := mustLoad(*regDir)
 
 	switch strings.Join(a[:min(2, len(a))], " ") {
+	case "doctor":
+		// Полный обход: каждый включённый сервер × все профили пользователя
+		// (одиночные + связки relay→exit) + сетевые ноги relay→выходы.
+		// Одна команда перед «можно подключаться».
+		xrayPath, _ := filepath.Abs("bin/xray")
+		chk := verify.New(r, xrayPath)
+		failsTotal := 0
+		for _, s := range r.Servers {
+			if !s.Enabled {
+				fmt.Printf("⚪ %s: disabled\n", s.ID)
+				continue
+			}
+			fails := 0
+			chk.Report = func(key, expectedIP string, err error) {
+				if err != nil {
+					fails++
+					fmt.Printf("  ✗ %-22s ожидание %s: %v\n", key, expectedIP, err)
+				} else {
+					fmt.Printf("  ✓ %-22s выход %s\n", key, expectedIP)
+				}
+			}
+			_ = chk.Server(ctx, s)
+			// релей → его выходы: сетевая досягаемость (без клиента)
+			if s.Kind == "relay" {
+				for _, exitID := range s.Exits {
+					var exit *registry.Server
+					for i := range r.Servers {
+						if r.Servers[i].ID == exitID {
+							exit = &r.Servers[i]
+						}
+					}
+					if exit == nil || !exit.Enabled {
+						continue
+					}
+					res, err := deploy.ProbeTarget(ctx, runner(r), s, exit.Host)
+					if err != nil {
+						// Информационно: настоящий вердикт по ноге даёт цепочка
+						// пользователя выше (profили relay→exit). Лег-проба без
+						// клиентского контекста даёт ложные SSL-срабатывания.
+						fmt.Printf("  ⚠ leg %-19s %s→%s: %v (цепочка решает)\n", s.ID+">"+exitID, s.Host, exit.Host, err)
+					} else {
+						fmt.Printf("  ✓ leg %-19s %s→%s tls=%v %dms\n", s.ID+">"+exitID, s.Host, exit.Host, res.TLS13, res.ConnectMS)
+					}
+				}
+			}
+			if fails == 0 {
+				fmt.Printf("🟢 %s: всё зелёное\n", s.ID)
+			} else {
+				fmt.Printf("🔴 %s: %d проблем\n", s.ID, fails)
+				failsTotal += fails
+			}
+			// Длительный тест: один живой туннель (профиль demo, для релея —
+			// его связка), держим soak-время: пинги каждые 10с + 10МБ раз в
+			// минуту. Показывает «рвётся ли» и «гоняет ли», а не разовый коннект.
+			if soakDur != 0 {
+				var sp *build.Profile
+				for _, u := range r.ActiveUsers() {
+					ps, _ := build.Profiles(r, u)
+					for i := range ps {
+						if ps[i].Server.ID == s.ID {
+							sp = &ps[i]
+							break
+						}
+					}
+					if sp != nil {
+						break
+					}
+				}
+				if sp == nil {
+					fmt.Printf("  ⚠ soak %s: нет прямого профиля\n", s.ID)
+				} else {
+					sr := chk.Soak(ctx, *sp, soakDur, 10*time.Second)
+					verdict := "🟢"
+					if sr.Stability < 100 {
+						verdict = "🟡"
+					}
+					if sr.Stability < 90 {
+						verdict = "🔴"
+						failsTotal++
+					}
+					fmt.Printf("  %s soak %-17s %.0f%% стабильно, ok=%d fail=%d, %.1f МБ\n", verdict, sr.Profile, sr.Stability, sr.OK, sr.Fail, float64(sr.Bytes)/1e6)
+					for _, f := range sr.Failures {
+						fmt.Printf("      · %s\n", f)
+					}
+				}
+			}
+		}
+		if failsTotal > 0 {
+			die("doctor: %d проблем(ы)", failsTotal)
+		}
+		fmt.Println("🩺 doctor: все серверы и связки зелёные")
 	case "validate":
 		mustValid(r)
 		if *geo {
@@ -210,14 +361,26 @@ func main() {
 		if err != nil {
 			die("%v", err)
 		}
-		pub, err := os.ReadFile(os.ExpandEnv("$HOME/.ssh/relaykit_ed25519.pub"))
+		pub, err := os.ReadFile(os.ExpandEnv("$HOME/.ssh/vpn-registry_ed25519.pub"))
 		if err != nil {
 			die("%v", err)
 		}
 		if err := deploy.Bootstrap(ctx, runner(r), s, helper, strings.TrimSpace(string(pub))); err != nil {
 			die("%v", err)
 		}
-		fmt.Printf("%s: bootstrap ok\n", s.ID)
+		if err := bootstrapAgent(ctx, r, s); err != nil {
+			die("%s: agent: %v", s.ID, err)
+		}
+		fmt.Printf("%s: bootstrap ok (agent installed)\n", s.ID)
+	case "server bootstrap-agent":
+		// Только vpn-agent + supervisor, без xray-релиза: для хостов, где
+		// вход отличается от «xray прямо на 443» (kz: nginx-фронт) или релиз
+		// обновляется отдельно.
+		s := server(r, a[2])
+		if err := bootstrapAgent(ctx, r, s); err != nil {
+			die("%s: agent: %v", s.ID, err)
+		}
+		fmt.Printf("%s: agent ok (stats + supervisor installed)\n", s.ID)
 	case "uuids fill":
 		toks, err := users.FillTokens(r)
 		if err != nil {
@@ -298,6 +461,41 @@ func main() {
 			die("%v", err)
 		}
 		saveAll(r)
+	case "deploy worker-secrets":
+		if r.Cloudflare.WorkerName == "" {
+			die("registry cloudflare.worker_name is empty")
+		}
+		tok, err := keychain.Get("cf-token")
+		if err != nil {
+			die("%v", err)
+		}
+		ws := &cf.WorkerSecrets{Account: r.Cloudflare.AccountID, Script: r.Cloudflare.WorkerName, Token: tok}
+		for _, s := range r.Servers {
+			if !s.Enabled {
+				continue
+			}
+			key := r.Secrets.Servers[s.ID].IngestKey
+			if key == "" {
+				die("%s: no ingest_key (run: vpn server bootstrap %s)", s.ID, s.ID)
+			}
+			if err := ws.Put(ctx, cf.SecretName(s.ID), key); err != nil {
+				die("%s: %v", s.ID, err)
+			}
+			fmt.Printf("  ✓ %s: %s secret set\n", s.ID, cf.SecretName(s.ID))
+		}
+	case "backup d1":
+		key, err := keychain.Get("age-key")
+		if err != nil {
+			die("%v", err)
+		}
+		outDir := os.ExpandEnv("$HOME/cc/_backups/vpn-registry")
+		paths, err := backup.D1(ctx, nil, ".", outDir, r.Cloudflare.D1Database, key, time.Now())
+		if err != nil {
+			die("backup: %v", err)
+		}
+		for _, p := range paths {
+			fmt.Printf("  ✓ %s\n", p)
+		}
 	case "deploy", "deploy servers", "deploy subs":
 		mustValid(r)
 		part := ""

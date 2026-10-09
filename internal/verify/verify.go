@@ -222,3 +222,91 @@ func (c *Checker) loadProfile(ctx context.Context, p build.Profile, parallel int
 	}
 	return ok + 1, parallel + 1, nil
 }
+
+// SoakResult — итог длительного теста: не «один раз подключилось», а
+// «держит и гоняет»: интервал мелких запросов + периодическая загрузка,
+// всё через ОДИН туннель (обрывы видны как провалы, xray сам чинит связь).
+type SoakResult struct {
+	Profile   string
+	OK, Fail  int
+	Bytes     int64
+	Failures  []string // первые 5 ошибок (диагностика)
+	Stability float64
+}
+
+// Soak гоняет профиль duration через один туннель: каждые interval —
+// generate_204, каждые 60с — 10 МБ загрузка. Возвращает статистику.
+func (c *Checker) Soak(ctx context.Context, p build.Profile, duration, interval time.Duration) SoakResult {
+	res := SoakResult{Profile: p.Key}
+	hc, stop, err := c.tunnel(ctx, p)
+	if err != nil {
+		res.Fail = 1
+		res.Failures = append(res.Failures, "tunnel: "+err.Error())
+		return res
+	}
+	defer stop()
+
+	deadline := time.Now().Add(duration)
+	nextBig := time.Now().Add(30 * time.Second)
+	var errs int
+	for time.Now().Before(deadline) {
+		sctx, cancel := context.WithTimeout(ctx, interval)
+		req, _ := http.NewRequestWithContext(sctx, http.MethodGet, "https://www.google.com/generate_204", nil)
+		if resp, err := hc.Do(req); err != nil {
+			res.Fail++
+			errs++
+			if errs <= 5 {
+				res.Failures = append(res.Failures, "ping: "+err.Error())
+			}
+		} else {
+			resp.Body.Close()
+			if resp.StatusCode == 204 {
+				res.OK++
+			} else {
+				res.Fail++
+				if errs <= 5 {
+					res.Failures = append(res.Failures, fmt.Sprintf("ping: status %d", resp.StatusCode))
+				}
+			}
+		}
+		cancel()
+
+		if time.Now().After(nextBig) {
+			big := &http.Client{Transport: hc.Transport, Timeout: 90 * time.Second}
+			bctx, bcancel := context.WithTimeout(ctx, 90*time.Second)
+			breq, _ := http.NewRequestWithContext(bctx, http.MethodGet, "https://speed.cloudflare.com/__down?bytes=10000000", nil)
+			if resp, err := big.Do(breq); err != nil {
+				res.Fail++
+				errs++
+				if errs <= 5 {
+					res.Failures = append(res.Failures, "download: "+err.Error())
+				}
+			} else {
+				n, _ := io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				res.Bytes += n
+				if n >= 10000000 {
+					res.OK++
+				} else {
+					res.Fail++
+					if errs <= 5 {
+						res.Failures = append(res.Failures, fmt.Sprintf("download short: %d bytes", n))
+					}
+				}
+			}
+			bcancel()
+			nextBig = nextBig.Add(60 * time.Second)
+		}
+
+		remain := time.Until(deadline)
+		if remain < interval {
+			break
+		}
+		time.Sleep(interval)
+	}
+	total := res.OK + res.Fail
+	if total > 0 {
+		res.Stability = float64(res.OK) / float64(total) * 100
+	}
+	return res
+}

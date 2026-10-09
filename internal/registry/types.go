@@ -92,6 +92,10 @@ type Cloudflare struct {
 	KVNamespaceID string `yaml:"kv_namespace_id"`
 	SubBaseURL    string `yaml:"sub_base_url"` // например: https://sub.example.com
 	Title         string `yaml:"title"`
+	WorkerName    string `yaml:"worker_name"`    // workers script name (этап 2)
+	D1Database    string `yaml:"d1_database"`    // имя БД для wrangler/бэкапа (этап 2)
+	AccessISS     string `yaml:"access_iss"`     // https://<team>.cloudflareaccess.com
+	AccessAUD     string `yaml:"access_aud"`     // AUD тег Access-приложения /admin
 }
 
 type Secrets struct {
@@ -106,6 +110,7 @@ type ServerSecrets struct {
 	PrivateKey string `yaml:"private_key"`
 	ShortID    string `yaml:"short_id"`
 	XHTTPPath  string `yaml:"xhttp_path"`
+	IngestKey  string `yaml:"ingest_key,omitempty"` // HMAC к /ingest, hex (этап 2)
 }
 
 type UserSecrets struct {

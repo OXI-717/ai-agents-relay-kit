@@ -69,6 +69,9 @@ func one(ctx context.Context, r *registry.Registry, run remote.Runner, verify fu
 		res.Err = fmt.Errorf("%s: xray -test failed, not activated: %w", s.ID, err)
 		return res
 	}
+	// Collect the last stats delta before the managed restart (spec §7.1);
+	// best-effort: absent agent or unreachable ingest must not block deploy.
+	_, _ = run.Run(ctx, s, false, h+"collect", nil)
 	if _, err := run.Run(ctx, s, false, h+"activate "+id, nil); err != nil {
 		res.Err = err
 	} else if verify != nil {

@@ -20,6 +20,7 @@ func randHex(n int) (string, error) {
 
 func Token() (string, error)   { return randHex(20) }
 func ShortID() (string, error) { return randHex(4) }
+func HMACKey() (string, error) { return randHex(32) }
 func UUID() string             { return uuid.NewString() }
 
 func Path() (string, error) {

@@ -85,7 +85,7 @@ describe("subscriptions", () => {
   });
 
   it("404 on malformed paths", async () => {
-    for (const p of ["/", "/s/", "/s/xyz?f=incy", `/s/${TOKEN.toUpperCase()}?f=incy`, `/s/${TOKEN}/extra?f=incy`, "/admin", "/ingest"]) {
+    for (const p of ["/", "/s/", "/s/xyz?f=incy", `/s/${TOKEN.toUpperCase()}?f=incy`, `/s/${TOKEN}/extra?f=incy`, "/adminx", "/ingestx"]) {
       const r = await SELF.fetch(`https://sub.test${p}`);
       expect(r.status, p).toBe(404);
       expect(await r.text(), p).toBe("");

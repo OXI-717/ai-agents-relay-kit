@@ -1,0 +1,9 @@
+[Unit]
+Description=VPN xray supervisor (one-shot, root)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpn-agent -supervise -config /etc/vpn-agent/agent.json
+# root нужен для vpn-helper activate (рестарт контейнера xray)

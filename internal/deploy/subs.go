@@ -45,6 +45,7 @@ func PlanKV(r *registry.Registry, updated int64) ([]cf.Entry, map[string]bool, e
 			k := KVKey(tok, f)
 			put = append(put, cf.Entry{Key: k, Value: string(body), Metadata: map[string]string{
 				"format": f, "title": title, "content_type": ct, "update_interval": "12",
+				"user_ref": registry.UserRef(u.ID),
 			}})
 			keep[k] = true
 			// Routing для happ и incy идёт заголовком воркера: JSON-тело не может
@@ -73,6 +74,9 @@ func Subs(ctx context.Context, r *registry.Registry, kv *cf.KV, updated int64) (
 	if err != nil {
 		return 0, 0, err
 	}
+	cat := Catalog(r, updated)
+	put = append(put, cat)
+	keep[cat.Key] = true
 	if err := kv.BulkPut(ctx, put); err != nil {
 		return 0, 0, err
 	}

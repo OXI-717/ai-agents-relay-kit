@@ -1,4 +1,4 @@
-// Package keychain stores relaykit credentials in the macOS login keychain.
+// Package keychain stores vpn-registry credentials in the macOS login keychain.
 package keychain
 
 import (
@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const service = "relaykit"
+const service = "vpn-registry"
 
 func Get(account string) (string, error) {
 	out, err := exec.Command("security", "find-generic-password", "-s", service, "-a", account, "-w").Output()

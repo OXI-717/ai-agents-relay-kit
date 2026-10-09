@@ -1,0 +1,15 @@
+[Unit]
+Description=VPN traffic stats agent (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=vpn-agent
+Group=vpn-agent
+ExecStart=/usr/local/bin/vpn-agent -config /etc/vpn-agent/agent.json
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/vpn-agent

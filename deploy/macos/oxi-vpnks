@@ -44,7 +44,7 @@ LOG="$STATE/guard.log"
 
 # Адреса входов VPN (источник истины — реестр; здесь слепок, обновляется вручную
 # через `oxi-vpnks refresh-entries` или правкой $CONF/entries.txt).
-SUB_DOMAIN="sub.example.com"  # домен вашей подписки (worker)
+SUB_DOMAIN="sub.sub.example.com"
 
 # Telegram Bot API (тг-роутер): публичные диапазоны Telegram AS62041
 # (core.telegram.org/resources/cidr.txt) + живой резолв api.telegram.org.
@@ -72,10 +72,12 @@ ensure_entries() {
   if [ ! -f "$CONF/entries.txt" ]; then
     cat > "$CONF/entries.txt" <<'EOF'
 # Адреса входов VPN (один IP/домен на строку)
-# Заполните адреса входов ваших серверов (или запустите refresh-entries
-# из реестра: vpn dist создаёт entries.txt рядом с конфигами)
-# 192.0.2.10        # exit-1
-# 192.0.2.20        # exit-2
+192.0.2.10      # kz
+192.0.2.20      # am
+192.0.2.30     # yc-relay
+192.0.2.40       # cr
+192.0.2.50       # lv
+192.0.2.60       # fr
 EOF
   fi
 }

@@ -1,5 +1,17 @@
 package registry
 
+import (
+	"crypto/sha256"
+	"encoding/hex"
+)
+
+// UserRef is the privacy-preserving user identifier stored in D1: names and
+// IDs never leave the registry; the worker admin maps ref→name via the catalog.
+func UserRef(userID string) string {
+	h := sha256.Sum256([]byte("vpn-registry:user:" + userID))
+	return hex.EncodeToString(h[:])[:16]
+}
+
 func PairKey(user, entry string, exit ...string) string {
 	key := user + "@" + entry
 	if len(exit) > 0 && exit[0] != "" {
