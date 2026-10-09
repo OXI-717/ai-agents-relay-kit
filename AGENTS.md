@@ -40,6 +40,14 @@
 | 4 | `runbooks/04-client.md` | клиент подключен, killswitch armed | курл-матрица (RU direct / proxy / DNS) |
 | 5 | `runbooks/05-ops.md` | эксплуатация: самолечение, ротация, инциденты | heartbeat в логах |
 
+## Реестр пользователя (данные вне репо)
+
+Реестр живёт у владельца ОТДЕЛЬНО от кита (приватный каталог/репо). Путь:
+- CLI: `vpn -registry <dir> …` или env `VPN_REGISTRY_DIR`
+- Killswitch `refresh-entries` читает `VPN_REGISTRY_DIR/servers.yaml`
+- Обновление боевого кода: `git pull` в checkout кита + kickstart демона
+  (`sudo launchctl kickstart -k system/com.oxi.vpnks` для killswitch)
+
 ## Отладка
 
 - Офлайн-харнес: `XRAY_LOCATION_ASSET=<geo-каталог> xray run -c <config>` с
