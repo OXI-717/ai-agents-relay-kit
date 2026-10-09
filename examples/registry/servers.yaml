@@ -1,0 +1,28 @@
+servers:
+  - id: kz
+    label: KZ
+    enabled: true
+    kind: exit
+    provider: test
+    location: Test City
+    host: 192.0.2.10
+    port: 443
+    ssh: { user: vpn-deploy, key: ~/.ssh/test }
+    reality: { target: "www.example.com:443", server_names: [www.example.com], public_key: TESTPUBKZ }
+  - id: am
+    label: AM
+    enabled: true
+    kind: exit
+    provider: test
+    location: Test Town
+    host: 192.0.2.20
+    port: 443
+    ssh: { user: vpn-deploy, key: ~/.ssh/test }
+    reality: { target: "www.example.org:443", server_names: [www.example.org], public_key: TESTPUBAM }
+  - id: off
+    label: OFF
+    enabled: false
+    kind: exit
+    host: 192.0.2.30
+    port: 443
+    reality: { target: "www.example.net:443", server_names: [www.example.net], public_key: TESTPUBOFF }

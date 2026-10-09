@@ -1,0 +1,8 @@
+pins:
+  server_image: "ghcr.io/xtls/xray-core@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  local_xray_url: "https://example.invalid/xray.zip"
+  local_xray_sha256: "00"
+  geoip_url: "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/200001010000/geoip.dat"
+  geoip_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+  geosite_url: "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/200001010000/geosite.dat"
+  geosite_sha256: "1111111111111111111111111111111111111111111111111111111111111111"

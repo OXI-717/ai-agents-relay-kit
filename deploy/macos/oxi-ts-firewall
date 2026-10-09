@@ -1,0 +1,12 @@
+#!/bin/bash
+# oxi-ts-firewall — постоянное разрешение Application Firewall для tailscaled.
+# Вызывается LaunchDaemon'ом com.oxi.tsfirewall при загрузке и при смене
+# бинаря (brew upgrade меняет inode → macOS снова спрашивала бы разрешение).
+# Идемпотентно. Покрывает оба варианта установки: brew (MacMax) и
+# ручной /usr/local/sbin (ноутбуки семьи).
+set -u
+for bin in /opt/homebrew/opt/tailscale/bin/tailscaled /usr/local/sbin/tailscaled; do
+  [ -x "$bin" ] || continue
+  /usr/libexec/ApplicationFirewall/socketfilterfw --add "$bin" >/dev/null 2>&1
+  /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$bin" >/dev/null 2>&1
+done

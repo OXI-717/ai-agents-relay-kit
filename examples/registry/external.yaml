@@ -1,0 +1,2 @@
+external:
+  - { id: ext-one, label: "ext · one", owner: "test owner", share_with: [alice], probe: false }

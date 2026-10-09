@@ -1,0 +1,5 @@
+cloudflare:
+  account_id: acc-test
+  kv_namespace_id: ns-test
+  sub_base_url: https://sub.example.test
+  title: Тест VPN

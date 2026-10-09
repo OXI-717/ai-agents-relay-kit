@@ -1,0 +1,209 @@
+{
+  "api": {
+    "listen": "127.0.0.1:10085",
+    "services": [
+      "StatsService"
+    ],
+    "tag": "api"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "email": "alice@tw/am",
+            "id": "66666666-6666-4666-8666-666666666666",
+            "level": 0
+          },
+          {
+            "email": "alice@tw/kz",
+            "id": "77777777-7777-4777-8777-777777777777",
+            "level": 0
+          }
+        ],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "enabled": true,
+        "routeOnly": true
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "realitySettings": {
+          "privateKey": "TESTPRIVKZ",
+          "serverNames": [
+            "www.example.com"
+          ],
+          "shortIds": [
+            "0a1b2c3d"
+          ],
+          "show": false,
+          "target": "www.example.com:443",
+          "xver": 0
+        },
+        "security": "reality",
+        "xhttpSettings": {
+          "mode": "auto",
+          "path": "/kzpath"
+        }
+      },
+      "tag": "in-443"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "loglevel": "error"
+  },
+  "outbounds": [
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "192.0.2.20",
+            "port": 443,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "88888888-8888-4888-8888-888888888888"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "realitySettings": {
+          "fingerprint": "chrome",
+          "publicKey": "TESTPUBAM",
+          "serverName": "www.example.org",
+          "shortId": "4e5f6a7b",
+          "spiderX": "/"
+        },
+        "security": "reality",
+        "xhttpSettings": {
+          "mode": "stream-one",
+          "path": "/ampath",
+          "xmux": {
+            "cMaxReuseTimes": 0,
+            "hKeepAlivePeriod": 0,
+            "hMaxRequestTimes": "600-900",
+            "hMaxReusableSecs": "1800-3000",
+            "maxConcurrency": "16-32",
+            "maxConnections": 0
+          }
+        }
+      },
+      "tag": "via-am"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "192.0.2.10",
+            "port": 443,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "99999999-9999-4999-8999-999999999999"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "realitySettings": {
+          "fingerprint": "chrome",
+          "publicKey": "TESTPUBKZ",
+          "serverName": "www.example.com",
+          "shortId": "0a1b2c3d",
+          "spiderX": "/"
+        },
+        "security": "reality",
+        "xhttpSettings": {
+          "mode": "stream-one",
+          "path": "/kzpath",
+          "xmux": {
+            "cMaxReuseTimes": 0,
+            "hKeepAlivePeriod": 0,
+            "hMaxRequestTimes": "600-900",
+            "hMaxReusableSecs": "1800-3000",
+            "maxConcurrency": "16-32",
+            "maxConnections": 0
+          }
+        }
+      },
+      "tag": "via-kz"
+    }
+  ],
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserDownlink": true,
+        "statsUserUplink": true
+      }
+    }
+  },
+  "routing": {
+    "rules": [
+      {
+        "outboundTag": "block",
+        "protocol": [
+          "bittorrent"
+        ],
+        "type": "field"
+      },
+      {
+        "ip": [
+          "0.0.0.0/8",
+          "10.0.0.0/8",
+          "100.64.0.0/10",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "224.0.0.0/4",
+          "fc00::/7",
+          "fe80::/10",
+          "::1/128"
+        ],
+        "outboundTag": "block",
+        "type": "field"
+      },
+      {
+        "outboundTag": "via-am",
+        "type": "field",
+        "user": [
+          "alice@tw/am"
+        ]
+      },
+      {
+        "outboundTag": "via-kz",
+        "type": "field",
+        "user": [
+          "alice@tw/kz"
+        ]
+      },
+      {
+        "network": "tcp,udp",
+        "outboundTag": "block",
+        "type": "field"
+      }
+    ]
+  },
+  "stats": {}
+}

@@ -1,0 +1,13 @@
+routing:
+  - id: default-ru
+    name: UNITE
+    direct_sites: ["geosite:yandex", "domain:tailscale.com"]
+    direct_ip: ["geoip:ru", "100.64.0.0/10"]
+    proxy_sites: ["geosite:telegram"]
+    proxy_ip: ["149.154.160.0/21"]
+transport:
+  client_mode: stream-one
+  server_mode: auto
+  xmux: { maxConcurrency: "16-32", maxConnections: 0, cMaxReuseTimes: 0, hMaxRequestTimes: "600-900", hMaxReusableSecs: "1800-3000", hKeepAlivePeriod: 0 }
+  fragment: { packets: tlshello, length: "100-200", interval: "10-20" }
+  dns: ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]

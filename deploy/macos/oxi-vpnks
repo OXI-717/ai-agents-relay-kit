@@ -1,0 +1,884 @@
+#!/bin/bash
+# oxi-vpnks — pf-based VPN kill switch для Mac Ильи.
+# Модель (блок — мостик до VPN, не постоянный фильтр):
+#   ON + нет туннеля → с физических интерфейсов наружу только LAN, DHCP,
+#     адреса входов VPN из реестра и api.telegram.org (чтобы тг-роутер
+#     оставался на связи для удалённых команд); всё остальное мертво,
+#     IPv6 глушится.
+#   ON + туннель поднялся (default route через utun*) → pf снимается целиком,
+#     дальше всё решает сам VPN.
+#   VPN упал → блок возвращается сам за ≤10 с.
+#   OFF (флаг) → блок снят до ребута/рестарта демона; при загрузке блок
+#     всегда снова в строю.
+#
+# Субкоманды:
+#   install    (sudo) поставить LaunchDaemon и включить
+#   uninstall  (sudo) снять демон, выключить pf, удалить /etc/oxi-vpnks
+#   on         снять флаг отключения (демон включит pf за ≤10 c)
+#   off        выставить флаг отключения (демон выключит pf за ≤10 c)
+#   status     показать состояние (демон, флаг, pf, таблицы)
+#   guard      (root, из LaunchDaemon) цикл поддержки правил
+#   apply      (root) собрать и загрузить ruleset + таблицы
+#
+# Самолечение (guard): «маршрут есть, трафик мёртв» и полный отвал VPN →
+# реинициализация INCY (quit → смена tunnelMode → возврат, рецепты 8.10/9.10),
+# rate limit 2/час, работает и при блоке OFF (pf не трогается).
+#
+# Отладка: лог демона — ~/.local/state/vpnks/guard.log (+ архивы .1-.3.gz,
+# ротация ~512 КБ; heartbeat раз в час, тишина >1 ч = демон мёртв).
+
+set -u
+# Демон под launchd стартует без HOME (или с /var/root): пути прибиваем
+# к дому реального пользователя, иначе guard умирал мгновенно (set -u +
+# пустой HOME), а флаг off писался бы в каталог, который демон не читает.
+# Приоритет: env OXI_HOME (пишется в plist при install) → SUDO_USER → HOME.
+OXI_HOME="${OXI_HOME:-${SUDO_USER:+$(eval echo "~$SUDO_USER")}}"
+OXI_HOME="${OXI_HOME:-${HOME:-/Users/oxi}}"
+STATE="$OXI_HOME/.local/state/vpnks"
+CONF="$OXI_HOME/.config/oxi-vpnks"
+ETC=/etc/oxi-vpnks
+PLIST=/Library/LaunchDaemons/com.oxi.vpnks.plist
+LABEL=com.oxi.vpnks
+DISABLED_FLAG="$STATE/disabled"
+LOG="$STATE/guard.log"
+
+# Адреса входов VPN (источник истины — реестр; здесь слепок, обновляется вручную
+# через `oxi-vpnks refresh-entries` или правкой $CONF/entries.txt).
+SUB_DOMAIN="sub.example.com"  # домен вашей подписки (worker)
+
+# Telegram Bot API (тг-роутер): публичные диапазоны Telegram AS62041
+# (core.telegram.org/resources/cidr.txt) + живой резолв api.telegram.org.
+# Нужно, чтобы при активном блоке роутер продолжал принимать команды из tg.
+TG_CIDRS="91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.56.0/22 91.105.192.0/23 149.154.160.0/20 185.76.151.0/24"
+TG_DOMAIN="api.telegram.org"
+
+# Управление машиной: BB cloud и tg-диспетчер. Резолвятся при каждом apply
+# (Cloudflare anycast — список короткий и стабильный). Осознанный компромисс:
+# те же anycast-IP обслуживают другие CF-сайты — плата за гарантированный
+# удалённый доступ к BB при активном блоке.
+MGMT_DOMAINS="getbb.app oxigen.getbb.app oxi-tg-dispatcher.still-hall-2fd3.workers.dev"
+
+# Tailscale: третий аварийный канал до машины при активном блоке.
+# Прямые P2P-соединения — udp/41641 наружу (правило ниже); здесь таблица
+# для control plane + DERP-релеев (fallback, когда P2P невозможен).
+TS_CTL_DOMAINS="login.tailscale.com controlplane.tailscale.com"
+TS_DERP_COUNT=30
+
+mkdir -p "$STATE" "$CONF"
+
+# --- данные -----------------------------------------------------------------
+
+ensure_entries() {
+  if [ ! -f "$CONF/entries.txt" ]; then
+    cat > "$CONF/entries.txt" <<'EOF'
+# Адреса входов VPN (один IP/домен на строку)
+# Заполните адреса входов ваших серверов (или запустите refresh-entries
+# из реестра: vpn dist создаёт entries.txt рядом с конфигами)
+# 192.0.2.10        # exit-1
+# 192.0.2.20        # exit-2
+EOF
+  fi
+}
+
+# Таймаут-обёртка: зависший mDNSResponder/dscacheutil не должен вешать цикл
+# демона (инцидент 9.10 12:36: guard встал навсегда в do_apply на резолве —
+# блок остался, туннель вернулся, никто не отпустил).
+to() { # to <сек> <команда...> — stdout протекает, при таймауте убивается
+  local s=$1; shift
+  "$@" & local p=$!
+  { sleep "$s"; kill -9 "$p" 2>/dev/null; } & local w=$!
+  wait "$p" 2>/dev/null
+  kill "$w" 2>/dev/null
+  wait "$w" 2>/dev/null
+  return 0
+}
+
+# Дедлайн текущего do_apply (epoch, 0 = не задан): резолвы после него
+# пропускаются — лучше таблица без пары адресов, чем зависший демон.
+APPLY_DEADLINE=0
+apply_late() { [ "$APPLY_DEADLINE" != 0 ] && [ "$(date +%s)" -gt "$APPLY_DEADLINE" ]; }
+
+# Резолв домена подписки через системный резолвер (DNS роутера — он в LAN, разрешён).
+resolve_sub() {
+  apply_late && return 0
+  to 3 dscacheutil -q host -a name "$SUB_DOMAIN" 2>/dev/null | awk '/ip_address:/{print $2}' | sort -u
+}
+
+# Живой резолв api.telegram.org (при блоке DNS идёт через mDNSResponder →
+# роутер в LAN — работает). Статические диапазоны выше — основа, это подстраховка.
+resolve_tg() {
+  apply_late && return 0
+  to 3 dscacheutil -q host -a name "$TG_DOMAIN" 2>/dev/null | awk '/ip_address:/{print $2}' | sort -u
+}
+
+# Живой резолв доменов управления (BB cloud, диспетчер).
+resolve_mgmt() {
+  apply_late && return 0
+  local d
+  for d in $MGMT_DOMAINS; do
+    apply_late && break
+    to 3 dscacheutil -q host -a name "$d" 2>/dev/null | awk '/ip_address:/{print $2}'
+  done | sort -u
+}
+
+# Резолв Tailscale control plane + DERP-релеев (derp1..N.tailscale.com;
+# несуществующие номера просто не резолвятся — это нормально).
+resolve_ts() {
+  apply_late && return 0
+  local d
+  for d in $TS_CTL_DOMAINS $(seq 1 $TS_DERP_COUNT | sed 's/^/derp/; s/$/.tailscale.com/'); do
+    apply_late && break
+    to 2 dscacheutil -q host -a name "$d" 2>/dev/null | awk '/ip_address:/{print $2}'
+  done | sort -u
+}
+
+# --- apply (root) ------------------------------------------------------------
+
+do_apply() {
+  ensure_entries
+  mkdir -p "$ETC"
+  # Бюджет всего apply: 25 с. Дальше резолвы пропускаются (apply_late) —
+  # зависший резолвер не может заморозить демон (инцидент 9.10 12:36).
+  APPLY_DEADLINE=$(( $(date +%s) + 25 ))
+
+  # Таблица DoH-резолверов: IP-хосты из dns-конфига транспорта (реестра)
+  # фиксированы генератором, но источник истины — те же значения прямо здесь,
+  # чтобы ruleset не зависел от правки реестра.
+  printf '1.1.1.1\n8.8.8.8\n' > "$ETC/doh.txt"
+
+  # Таблица входов VPN: статика + резолв домена подписки
+  { grep -vE '^\s*(#|$)' "$CONF/entries.txt" | awk '{print $1}'; resolve_sub; } \
+    | sort -u > "$ETC/allow.txt"
+
+  # Таблица Telegram: публичные CIDR + живой резолв api.telegram.org
+  { echo $TG_CIDRS | tr ' ' '\n'; resolve_tg; } | sort -u > "$ETC/tg.txt"
+
+  # Таблица управления: BB cloud + tg-диспетчер (живой резолв)
+  resolve_mgmt > "$ETC/mgmt.txt"
+
+  # Таблица Tailscale: control plane + DERP (живой резолв)
+  resolve_ts > "$ETC/ts.txt"
+
+  cat > "$ETC/pf.conf" <<EOF
+# oxi-vpnks: stock macOS anchors + наш default-deny anchor
+# Без skip lo0 финальный block глушит localhost: DNS через mDNSResponder и
+# локальный SOCKS INCY (127.0.0.1:10808) — итог "всё мертво даже с VPN".
+set skip on lo0
+scrub-anchor "com.apple/*"
+nat-anchor "com.apple/*"
+rdr-anchor "com.apple/*"
+dummynet-anchor "com.apple/*"
+anchor "com.apple/*"
+load anchor "com.apple" from "/etc/pf.anchors/com.apple"
+anchor "oxi.vpnks" all
+load anchor "oxi.vpnks" from "$ETC/anchor.conf"
+EOF
+
+  # Живые туннельные интерфейсы — явный перечень поверх `on utun`
+  # (на случай если prefix-match по имени драйвера не сработает).
+  # Внимание: списки { } в pf требуют пробелов вокруг запятых — "{a, b}",
+  # а "{a,b}" — syntax error. И не вставлять их в ${var:+...}: первый }
+  # закроет расширение bash. Собираем строку заранее.
+  local TUN_IFACES TUN_RULE
+  TUN_IFACES=$(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -E '^(utun|ipsec|ppp)[0-9]+' | sed 's/$/, /' | tr -d '\n' | sed 's/, $//')
+  TUN_RULE=""; [ -n "$TUN_IFACES" ] && TUN_RULE="pass out quick on { $TUN_IFACES } inet all"
+
+  cat > "$ETC/anchor.conf" <<EOF
+table <vpnks_allow> persist
+table <vpnks_tg> persist
+table <vpnks_mgmt> persist
+table <vpnks_ts> persist
+table <vpnks_doh> persist
+# DHCP
+pass out quick inet proto udp from any to any port 67:68 keep state
+# DNS любому резолверу: без этого на машинах, чей DNS не роутер, mDNSResponder
+# вис при блоке — в том числе намертво во время apply (инцидент Air 5.10:
+# 37 резолвов в resolve_* ушли в никуда, sshd перестал отвечать баннер).
+pass out quick inet proto { tcp, udp } from any to any port 53 keep state
+# DoH-резолверы по IP (1.1.1.1/8.8.8.8 tcp+udp 443): xray-конфиги ходят на
+# https://<ip>/dns-query — без этого правила наш же блок резал DoH в окне
+# подключения, INCY поднимался полумёртвым (инцидент 9.10: «при снятом
+# блоке запускается, при стоящем — нет»). QUIC (udp/443) — на будущее.
+pass out quick inet proto { tcp, udp } from any to <vpnks_doh> port 443 keep state
+# LAN / link-local / multicast / CGNAT
+pass out quick inet from any to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255 } keep state
+# входы VPN + домен подписки
+pass out quick inet proto { tcp, udp } from any to <vpnks_allow> keep state
+# Telegram Bot API — тг-роутер остаётся на связи при активном блоке
+pass out quick inet proto tcp from any to <vpnks_tg> port 443 keep state
+# Управление: BB cloud + tg-диспетчер (tcp и udp/443 для QUIC)
+pass out quick inet proto { tcp, udp } from any to <vpnks_mgmt> port 443 keep state
+# Tailscale: прямые P2P (WireGuard udp/41641) + control/DERP fallback
+pass out quick inet proto udp from any to any port 41641 keep state
+pass out quick inet proto { tcp, udp } from any to <vpnks_ts> port { 443, 3478 } keep state
+# туннельные интерфейсы — свободны на окно до снятия pf (INCY создаёт utun244)
+pass out quick on utun inet all
+$TUN_RULE
+# AirDrop/Handoff
+pass out quick on { awdl0, llw0 } all
+# IPv6 снаружи глушим (канал утечек)
+block return out quick inet6 all
+# всё остальное — в никуда
+block drop out log (all) quick inet all
+EOF
+  unset TUN_IFACES TUN_RULE
+
+  # Сначала только парсим: живой ruleset не трогаем, пока файл не доказал
+  # валидность (pfctl -vnf работает без влияния на pf).
+  if ! out=$(pfctl -vnf "$ETC/pf.conf" 2>&1 >/dev/null); then
+    echo "ERROR: ruleset невалиден, pf не трогал:" >&2
+    echo "$out" >&2
+    return 1
+  fi
+  # НЕ сносим старый анкер вручную: `load anchor` внутри `pfctl -f` перегружает
+  # анкер атомарно. Ручной flush оставлял окно fail-open (пустой анкер между
+  # -F и -f), а при конкурентном apply — ещё и гонку (ревью 5.10).
+  # На уже включённом pf повторный `-e` завершается "pf already enabled" с
+  # ненулевым кодом — поэтому enable только когда pf выключен.
+  if pfctl -s info 2>/dev/null | grep -q "Status: Enabled"; then pf_flags=-f; else pf_flags=-ef; fi
+  if ! out=$(pfctl $pf_flags "$ETC/pf.conf" 2>&1); then
+    echo "ERROR: pfctl не принял ruleset:" >&2
+    echo "$out" >&2
+    return 1
+  fi
+  for spec in "vpnks_allow:$ETC/allow.txt" "vpnks_tg:$ETC/tg.txt" "vpnks_mgmt:$ETC/mgmt.txt" "vpnks_ts:$ETC/ts.txt" "vpnks_doh:$ETC/doh.txt"; do
+    if ! out=$(pfctl -a oxi.vpnks -t "${spec%%:*}" -T replace -f "${spec##*:}" 2>&1); then
+      echo "ERROR: таблица ${spec%%:*}: $out" >&2
+      return 1
+    fi
+  done
+}
+
+# --- guard (root) ------------------------------------------------------------
+
+# VPN поднялся = default route уходит на туннельный интерфейс (INCY → utun244,
+# exit node Tailscale — тоже utun). Один utun без default route (пустой
+# tailscale без exit) VPN не считается.
+# Живость туннеля — по СЕРВИСАМ, которые реально нужны, а не по одному IP.
+# Ночной инцидент 8.10: websocket до getbb.app флапал 4 часа, ifconfig.me при
+# этом отвечал — детектор молчал, bb лежал с 21:01 до 02:01.
+# Падает ЛЮБОЙ критичный — туннель считается мёртвым.
+tunnel_probe() {
+  local url
+  for url in https://ifconfig.me https://oxigen.getbb.app https://api.telegram.org; do
+    curl -s -m 6 -o /dev/null "$url" 2>/dev/null && continue
+    return 1
+  done
+  return 0
+}
+
+vpn_is_up() {
+  local def_if
+  def_if=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $NF; exit}')
+  # utun (INCY/Happ/Tailscale), ipsec/ppp (IKEv2/L2TP — иначе живой VPN на ppp
+  # признавался бы «нет VPN» и гейт резал живую сеть).
+  [ "${def_if#utun}" != "$def_if" ] || [ "${def_if#ipsec}" != "$def_if" ] || [ "${def_if#ppp}" != "$def_if" ]
+}
+
+pf_enabled()  { pfctl -s info 2>/dev/null | grep -q "Status: Enabled"; }
+anchor_live() { pfctl -a oxi.vpnks -s rules 2>/dev/null | grep -q .; }
+release() {
+  # Снимаем только СВОЙ анкер — чужие правила и состояние pf не трогаем.
+  pfctl -a oxi.vpnks -F all >/dev/null 2>&1
+}
+
+# --- самолечение туннеля ------------------------------------------------------
+# Инцидент 5.10.2026: после 50 ч сна VLESS-outbound xray умер, default route
+# на utun остался → DoH через proxy умер → DNS/агенты лежали час до ручного
+# рестарта INCY. Слой: детект (ниже в guard) → break-glass маршруты → рестарт.
+
+HEAL_MAX_PER_HOUR=2
+INCY_APP="/Applications/incy.app"
+INCY_PREFS="$OXI_HOME/Library/Application Support/incy/preferences.json"
+BG_CACHE="$STATE/breakglass.txt"    # кэш IP для break-glass (обновляется на живом туннеле)
+BG_ACTIVE="$STATE/breakglass.active"
+HEAL_LOG="$STATE/heals"             # таймстемпы попыток рестарта
+
+# Лечить полудохлый туннель и при блоке OFF (инцидент 9.10: полдня ручной
+# возни при OFF — детектор работал только в ON). pf при этом не трогаем.
+HEAL_OFF_MODE=1
+
+# Смена tunnelMode в preferences.json INCY — ТОЛЬКО при закрытом приложении
+# (живой PreferencesManager перезапишет файл из памяти). Root-демон пишет в
+# файл пользователя: права/владелец сохраняются, замена атомарная.
+incy_set_mode() { # $1 = TUN|SYSTEM_PROXY|PROXY_ONLY
+  python3 - "$INCY_PREFS" "$1" <<'PYEOF' 2>/dev/null
+import json, os, sys, tempfile
+p, mode = sys.argv[1], sys.argv[2]
+try:
+    st = os.stat(p)
+    d = json.load(open(p))
+except Exception:
+    sys.exit(1)
+d['tunnelMode'] = mode
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p))
+with os.fdopen(fd, 'w') as f:
+    json.dump(d, f, indent=2, ensure_ascii=False)
+os.chown(tmp, st.st_uid, st.st_gid)
+os.chmod(tmp, st.st_mode & 0o7777)
+os.replace(tmp, p)
+PYEOF
+}
+
+incy_tunnel_mode() {
+  python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('tunnelMode','TUN'))" "$INCY_PREFS" 2>/dev/null || echo TUN
+}
+
+# Полное закрытие INCY: штатный quit, затем pkill. 0 = закрыта.
+incy_quit() { # $1 = uid консольного пользователя
+  launchctl asuser "$1" osascript -e 'tell application "incy" to quit' >/dev/null 2>&1
+  local i
+  for i in 1 2 3 4 5 6; do pgrep -x incy >/dev/null || break; sleep 2; done
+  pkill -x incy 2>/dev/null
+  # Зомби-ядро xray переживает приложение и держит socks 10808 — следующий
+  # старт падает 'bind: address already in use' (ошибка с экрана владельца,
+  # вечер 9.10). Добиваем и его.
+  pkill -f "resources/bin/xray" 2>/dev/null
+  sleep 2
+  pgrep -x incy >/dev/null && return 1
+  return 0
+}
+
+# Ждём освобождения socks-порта (10808) с лимитом: bind на занятый порт —
+# самый частый отказ старта xray после неудачного отключения.
+SOCKS_PORT=10808
+port_free() { ! lsof -nP -iTCP:"$SOCKS_PORT" >/dev/null 2>&1; }
+wait_port_free() { # $1=max_сек — 0=свободен
+  local i
+  for i in $(seq 1 "${1:-20}"); do
+    port_free && return 0
+    sleep 1
+  done
+  port_free
+}
+
+socks_alive() { /usr/bin/nc -z 127.0.0.1 10808 >/dev/null 2>&1; }
+
+# Ждём исчезновения интерфейса с лимитом времени: юнит utun (в INCY для
+# macOS захардкожен utun244) после убийства процесса освобождается ядром
+# НЕ мгновенно — новый xray при занятом юните получает "connection was
+# refused" (инцидент 9.10 13:13). Поэтому между quit и relaunch ждём
+# факта, а не константного сна.
+wait_iface_gone() { # $1=iface $2=max_сек — 0=исчез, 1=так и висит
+  local i
+  for i in $(seq 1 "${2:-20}"); do
+    ifconfig "$1" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  ifconfig "$1" >/dev/null 2>&1 && return 1
+  return 0
+}
+
+# Физический шлюз LAN (default route на en*), нужен для прямых маршрутов.
+lan_gateway() { netstat -rn -f inet 2>/dev/null | awk '$1=="default" && $NF ~ /^en/ {print $2; exit}'; }
+
+# Break-glass: пока туннель dead (pf снят), tg + BB идут напрямую через LAN-шлюз
+# — тг-роутер и BB-управление продолжают работать и могут уведомить владельца.
+# TG покрывается статическими CIDR (DNS на dead-туннеле может не работать),
+# BB — кэшированными IP (anycast стабилен, кэш обновляется на живом туннеле).
+breakglass_on() {
+  [ -f "$BG_ACTIVE" ] && return 0
+  local gw; gw=$(lan_gateway)
+  [ -n "$gw" ] || { echo "$(date '+%F %T') break-glass: нет LAN-шлюза — пропуск"; return 1; }
+  # В журнал маршрутов пишем ТОЛЬКО успешно добавленные нами — иначе breakglass_off
+  # мог бы снести маршрут, который существовал до нас (ревью 5.10).
+  : > "$BG_ACTIVE.tmp"
+  local net ok=0
+  while IFS= read -r net; do
+    [ -n "$net" ] || continue
+    case "$net" in
+      */*) route add -net  "$net" "$gw" >/dev/null 2>&1 && { echo "$net" >> "$BG_ACTIVE.tmp"; ok=$((ok+1)); };;
+      *)   route add -host "$net" "$gw" >/dev/null 2>&1 && { echo "$net" >> "$BG_ACTIVE.tmp"; ok=$((ok+1)); };;
+    esac
+  done <<EOF2
+$( { echo $TG_CIDRS | tr ' ' '\n'; cat "$BG_CACHE" 2>/dev/null; } | sort -u )
+EOF2
+  mv "$BG_ACTIVE.tmp" "$BG_ACTIVE"
+  echo "$(date '+%F %T') break-glass ON: $ok прямых маршрутов через $gw (tg + BB)"
+}
+
+breakglass_off() {
+  [ -f "$BG_ACTIVE" ] || return 0
+  local net
+  while IFS= read -r net; do
+    [ -n "$net" ] || continue
+    case "$net" in
+      */*) route delete -net  "$net" >/dev/null 2>&1;;
+      *)   route delete -host "$net" >/dev/null 2>&1;;
+    esac
+  done < "$BG_ACTIVE"
+  rm -f "$BG_ACTIVE"
+  echo "$(date '+%F %T') break-glass OFF"
+}
+
+# Рестарт INCY из root-демона: quit/open в GUI-сессии консольного пользователя
+# (launchctl asuser), fallback — pkill. Rate limit: HEAL_MAX_PER_HOUR в час.
+heal_incy() {
+  local now; now=$(date +%s)
+  local n=0 t
+  touch "$HEAL_LOG"
+  # журнал попыток подрезаем — append-only без чистки разрастался бы вечно
+  [ "$(count_lines "$HEAL_LOG")" -gt 100 ] && { tail -50 "$HEAL_LOG" > "$HEAL_LOG.tmp" && mv "$HEAL_LOG.tmp" "$HEAL_LOG"; }
+  while IFS= read -r t; do
+    [ $((now - t)) -lt 3600 ] && n=$((n+1))
+  done < "$HEAL_LOG"
+  if [ "$n" -ge "$HEAL_MAX_PER_HOUR" ]; then
+    echo "$(date '+%F %T') HEAL FAILED: уже $n попыток за час — стоп, нужен ручной разбор"
+    echo "heal-failed $now" > "$STATE/tun_health"
+    return 1
+  fi
+  local uid; uid=$(stat -f %u /dev/console 2>/dev/null)
+  if [ -z "$uid" ] || [ "$uid" = "0" ]; then
+    echo "$(date '+%F %T') HEAL: нет консольного пользователя — рестарт INCY невозможен (после логина поднимется сам)"
+    return 1
+  fi
+  # Защита от пересечения: если INCY моложе 5 минут — его уже кто-то рестартует
+  # (предыдущий heal или человек руками). Не мешаем.
+  local pid etime
+  pid=$(pgrep -x incy | head -1)
+  if [ -n "$pid" ]; then
+    etime=$(ps -o etime= -p "$pid" 2>/dev/null | awk '{n=split($1,a,":"); if(n==1) print a[1]; else if(n==2) print a[1]*60+a[2]; else print a[1]*3600+a[2]*60+a[3]}')
+    if [ -n "$etime" ] && [ "$etime" -lt 300 ]; then
+      echo "$(date '+%F %T') HEAL: INCY моложе 5 минут (${etime}с) — уже кто-то рестартует, не мешаю"
+      return 0
+    fi
+  fi
+  echo "$now" >> "$HEAL_LOG"
+  echo "$(date '+%F %T') TUNNEL DEAD → реинициализация INCY (попытка $((n+1))/$HEAL_MAX_PER_HOUR за час)"
+  # Рецепт инцидентов 8.10/9.10: простой рестарт НЕ лечит залипшее состояние
+  # INCY (мёртвый трафик при живом DNS и живой цепочке), а смена tunnelMode
+  # через полный quit — лечит (аналог ручного «удалить подписку и добавить
+  # заново»). Поэтому: quit → временный другой режим → дождались socks →
+  # quit → вернуть исходный режим → запуск. Исходный режим возвращаем всегда.
+  local orig_mode; orig_mode=$(incy_tunnel_mode)
+  # Имя туннельного интерфейса ДО закрытия: его юнит должен освободиться
+  # до перезапуска, иначе xray получит "connection was refused".
+  local tun_if=""
+  case "$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $NF; exit}')" in
+    utun*) tun_if=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $NF; exit}');;
+  esac
+  if ! incy_quit "$uid"; then
+    echo "$(date '+%F %T') HEAL FAILED: INCY не закрывается принудительно"
+    echo "heal-failed $now" > "$STATE/tun_health"
+    return 1
+  fi
+  if [ -n "$tun_if" ]; then
+    if wait_iface_gone "$tun_if" 30; then
+      echo "$(date '+%F %T') реинициализация: юнит $tun_if освобождён"
+    else
+      # Юнит держит зависший root-helper INCY (живой тест владельца 9.10:
+      # окно освобождения 3-5 минут, совпадает с 120с админ-таймаутом INCY
+      # + повтор). Принудительно снимаем процесс — юнит освобождается сразу.
+      echo "$(date '+%F %T') реинициализация: $tun_if занят 30с — убиваю зависший incy-helper"
+      pkill -f incy-helper 2>/dev/null
+      if wait_iface_gone "$tun_if" 30; then
+        echo "$(date '+%F %T') реинициализация: юнит $tun_if освобождён после cleanup"
+      else
+        echo "$(date '+%F %T') реинициализация: $tun_if не освободился и после cleanup — продолжаю (риск refused)"
+      fi
+    fi
+  fi
+  # Порт socks: занятый 10808 = следующий старт xray упадёт на bind.
+  if ! port_free; then
+    echo "$(date '+%F %T') реинициализация: порт $SOCKS_PORT ещё занят — жду освобождения"
+    wait_port_free 30 || echo "$(date '+%F %T') реинициализация: порт $SOCKS_PORT не освободился за 30с (TIME_WAIT?) — продолжаю"
+  fi
+  local alt_mode
+  # Промежуточный режим — ТОЛЬКО PROXY_ONLY: чистые соксы без системных
+  # настроек. SYSTEM_PROXY не годится для безлюдного лечения: MacSystemProxy
+  # в INCY ставит системный прокси через osascript с админ-правами → диалог
+  # пароля → 120с таймаут "user did not dismiss password dialog" (9.10).
+  if [ "$orig_mode" = "PROXY_ONLY" ]; then alt_mode="TUN"; else alt_mode="PROXY_ONLY"; fi
+  incy_set_mode "$alt_mode"
+  launchctl asuser "$uid" open -a "$INCY_APP" >/dev/null 2>&1
+  local i
+  for i in 1 2 3 4 5 6 7 8; do socks_alive && break; sleep 3; done
+  if socks_alive; then
+    echo "$(date '+%F %T') реинициализация: временный режим $alt_mode поднялся (socks 10808 жив)"
+    # Settle: дать INCY полностью инициализироваться во временном режиме —
+    # мгновенный quit после появления socks оставляет наполовину поднятое
+    # состояние (живой тест 9.10 12:36). Это не ожидание события (внутреннее
+    # состояние приложения снаружи не наблюдаемо) — фиксированный запас.
+    sleep 10
+  else
+    echo "$(date '+%F %T') реинициализация: socks не поднялся за 24с — всё равно возвращаю режим (деградация до рестарта)"
+  fi
+  # Юнит временного туннеля (если alt-режим = TUN) тоже освобождаем до старта.
+  local tun_if2=""
+  case "$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $NF; exit}')" in
+    utun*) tun_if2=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $NF; exit}');;
+  esac
+  incy_quit "$uid" >/dev/null 2>&1
+  [ -n "$tun_if2" ] && wait_iface_gone "$tun_if2" 20 \
+    && echo "$(date '+%F %T') реинициализация: юнит $tun_if2 освобождён"
+  incy_set_mode "$orig_mode"
+  launchctl asuser "$uid" open -a "$INCY_APP" >/dev/null 2>&1
+  # Ждём туннель до 45с — вердикт в логе сразу, а не «жду туннель» вслепую.
+  local tun_ok=no i2
+  for i2 in $(seq 1 15); do
+    if vpn_is_up; then tun_ok=yes; break; fi
+    sleep 3
+  done
+  echo "$(date '+%F %T') реинициализация: режим $orig_mode возвращён, туннель: $tun_ok (дальше probe цикла решает)"
+}
+
+# wc -l < файл падает на отсутствующем файле ошибкой редиректа до wc —
+# считаем аккуратно (mgmt.txt появляется только после первого apply).
+count_lines() { if [ -f "$1" ]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
+
+write_status() {
+  printf 'mode=%s\npf=%s\nvpn=%s\nallow=%s\ntg=%s\nmgmt=%s\ntsip=%s\nts=%s\n' "$1" "$2" "$3" \
+    "$(count_lines "$ETC/allow.txt")" \
+    "$(count_lines "$ETC/tg.txt")" \
+    "$(count_lines "$ETC/mgmt.txt")" \
+    "$(count_lines "$ETC/ts.txt")" \
+    "$(date +%s)" > "$STATE/status.tmp" && mv "$STATE/status.tmp" "$STATE/status"
+}
+
+# Ротация лога: copytruncate (fd демона остаётся на том же файле),
+# храним 3 сжатых архива рядом с guard.log. Лимит ~512 КБ.
+rotate_log() {
+  [ -f "$LOG" ] || return 0
+  local sz; sz=$(stat -f %z "$LOG" 2>/dev/null || echo 0)
+  [ "$sz" -lt 524288 ] && return 0
+  [ -f "$LOG.2.gz" ] && mv "$LOG.2.gz" "$LOG.3.gz"
+  [ -f "$LOG.1.gz" ] && mv "$LOG.1.gz" "$LOG.2.gz"
+  if cp "$LOG" "$LOG.1" && : > "$LOG"; then
+    gzip -f "$LOG.1" 2>/dev/null &
+    echo "$(date '+%F %T') log rotated (было ${sz} байт, архивы: guard.log.{1..3}.gz)"
+  fi
+}
+
+do_guard() {
+  exec >>"$LOG" 2>&1
+  rotate_log
+  echo "$(date '+%F %T') guard start (pid $$)"
+  # При старте демона (загрузка или рестарт) блок всегда возвращается:
+  # off действует только до ребута/рестарта — иначе гейт теряет смысл.
+  rm -f "$DISABLED_FLAG"
+  local last_refresh=0 applied_tun=-1 last_beat=0 last_tuncheck=0 tun_fail=0 prev_ts vpn_down_since=0
+  prev_ts=$(date +%s)
+  while true; do
+    rotate_log
+    # Сон/простой: скачок времени между циклами >120 с — после него туннель
+    # умирает чаще всего (5.10), проверяем его немедленно, а не через 5 мин.
+    local loop_now; loop_now=$(date +%s)
+    if [ $((loop_now - prev_ts)) -gt 120 ]; then
+      echo "$(date '+%F %T') простой $((loop_now - prev_ts))с (сон?) — форсирую проверку туннеля"
+      last_tuncheck=0
+    fi
+    prev_ts=$loop_now
+    if [ -f "$DISABLED_FLAG" ]; then
+      if anchor_live; then
+        release && echo "$(date '+%F %T') блок снят (флаг off)"
+      fi
+      breakglass_off
+      vpn_down_since=0
+      # OFF ≠ слепота (инцидент 9.10: при OFF полудохлый туннель жил полдня
+      # без присмотра — детектор был только в ON). Если туннель поднят —
+      # следим за ним тем же зондом и лечим реинициализацией. pf НЕ трогаем:
+      # блок выключен пользователем осознанно. VPN отсутствует при OFF —
+      # выбор пользователя, не лечим.
+      if [ "$HEAL_OFF_MODE" = 1 ] && vpn_is_up; then
+        local now2; now2=$(date +%s)
+        if [ $((now2 - last_tuncheck)) -ge 300 ]; then
+          last_tuncheck=$now2
+          if tunnel_probe; then
+            if [ "$tun_fail" -ge 3 ]; then
+              echo "$(date '+%F %T') туннель ожил, провалов было: $tun_fail"
+            fi
+            tun_fail=0; rm -f "$STATE/tun_health"
+          else
+            tun_fail=$((tun_fail + 1))
+            echo "$(date '+%F %T') TUNNEL DEAD (блок OFF): трафик не идёт, провалов $tun_fail"
+            if [ "$tun_fail" -eq 3 ]; then
+              echo "dead $(date +%s)" > "$STATE/tun_health"
+              heal_incy
+            elif [ "$tun_fail" -gt 3 ] && [ $((tun_fail % 6)) -eq 0 ]; then
+              heal_incy
+            fi
+          fi
+        fi
+        write_status off released up
+      else
+        rm -f "$STATE/tun_health"
+        tun_fail=0
+        write_status off released down
+      fi
+    elif vpn_is_up; then
+      # VPN держит выход — блок полностью снимается, дальше решает сам VPN
+      vpn_down_since=0
+      if anchor_live; then
+        release && echo "$(date '+%F %T') VPN поднялся — блок снят"
+      fi
+      # Детектор «маршрут есть, туннель мёртв» (инцидент 5.10: default route
+      # на utun стоял, но DoH xray через proxy умер — DNS/агенты лежали ~час
+      # до рестарта INCY). Каждые 5 мин curl через туннель; 3 промаха = dead
+      # → break-glass маршруты + авто-рестарт INCY (с rate limit).
+      local now2; now2=$(date +%s)
+      if [ $((now2 - last_tuncheck)) -ge 300 ]; then
+        last_tuncheck=$now2
+        if tunnel_probe; then
+          if [ "$tun_fail" -ge 3 ]; then
+            echo "$(date '+%F %T') туннель ожил (провалов было: $tun_fail)"
+            breakglass_off
+          fi
+          tun_fail=0; rm -f "$STATE/tun_health"
+          # Кэш IP для break-glass обновляем на живом туннеле — на мёртвом
+          # DNS может не работать, а маршруты нужны мгновенно.
+          { resolve_tg; resolve_mgmt; } > "$BG_CACHE.tmp" 2>/dev/null
+          [ -s "$BG_CACHE.tmp" ] && mv "$BG_CACHE.tmp" "$BG_CACHE" || rm -f "$BG_CACHE.tmp"
+        else
+          tun_fail=$((tun_fail + 1))
+          if [ "$tun_fail" -eq 3 ]; then
+            echo "$(date '+%F %T') TUNNEL DEAD: default route на utun есть, но трафик не идёт 15 мин"
+            echo "dead $(date +%s)" > "$STATE/tun_health"
+            breakglass_on
+            heal_incy
+          elif [ "$tun_fail" -gt 3 ]; then
+            echo "$(date '+%F %T') TUNNEL DEAD: всё ещё мёртв (провалов: $tun_fail)"
+            # Рестарт INCY мог уронить туннель и поднять новый — даём окно,
+            # потом повторное лечение (rate limit в heal_incy).
+            [ $((tun_fail % 6)) -eq 0 ] && heal_incy
+          fi
+        fi
+      fi
+      write_status on released up
+    else
+      # VPN нет — блок держим; метка здоровья туннеля и break-glass неактуальны
+      # (при enforced tg+BB открыты через pf-таблицы).
+      breakglass_off
+      rm -f "$STATE/tun_health"
+      # VPN упал и не возвращается 5 минут — INCY мог зависнуть или умереть:
+      # лечим тем же рестартом (rate limit внутри). До этого случая 5.10 15:20
+      # (уход VPN после конфликта маршрутов) лечение покрывало только
+      # полудохлый туннель, а полный отвал — нет.
+      local now3; now3=$(date +%s)
+      [ "$vpn_down_since" -eq 0 ] && vpn_down_since=$now3
+      if [ $((now3 - vpn_down_since)) -ge 300 ]; then
+        echo "$(date '+%F %T') VPN отсутствует $(( (now3 - vpn_down_since) / 60 )) мин — пробую рестарт INCY"
+        heal_incy
+        vpn_down_since=$now3
+      fi
+      local cur_tun; cur_tun=$(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -cE '^(utun|ipsec|ppp)[0-9]+')
+      if ! pf_enabled || ! anchor_live; then
+        echo "$(date '+%F %T') нет VPN — включаю блок"
+        do_apply && applied_tun=$cur_tun
+      elif [ "$cur_tun" != "$applied_tun" ]; then
+        echo "$(date '+%F %T') новый туннельный интерфейс — перегружаю ruleset"
+        do_apply && applied_tun=$cur_tun
+      fi
+      local now; now=$(date +%s)
+      if [ $((now - last_refresh)) -ge 300 ]; then
+        do_apply && applied_tun=$cur_tun   # свежие entries + резолв подписки
+        # Самопроверка: при живом блоке прямой путь на en0 мёртв.
+        # Зарубежный IP ответил напрямую = ruleset продырявлен — перегружаем.
+        if curl -s -m 3 --interface en0 -o /dev/null https://ifconfig.me 2>/dev/null; then
+          echo "$(date '+%F %T') LEAK: en0 ходит наружу при включённом pf — перегружаю ruleset"
+          do_apply && applied_tun=$cur_tun
+        fi
+        last_refresh=$now
+      fi
+      write_status on enforced down
+    fi
+    # Heartbeat раз в час: без него тишина в логе неотличима от мёртвого демона
+    # (выходные 3–5.10: блок держался ~50 ч, а записей не было — нечего разбирать).
+    local hb_now; hb_now=$(date +%s)
+    if [ $((hb_now - last_beat)) -ge 3600 ]; then
+      local hb_pf hb_vpn
+      anchor_live && hb_pf=enforced || hb_pf=released
+      vpn_is_up && hb_vpn=up || hb_vpn=down
+      echo "$(date '+%F %T') alive: pf=$hb_pf vpn=$hb_vpn"
+      last_beat=$hb_now
+    fi
+    sleep 10
+  done
+}
+
+# --- install / uninstall (root) ----------------------------------------------
+
+do_install() {
+  [ "$(id -u)" -ne 0 ] && { echo "Нужен sudo: sudo $0 install" >&2; exit 1; }
+  ensure_entries
+  do_apply || exit 1
+  # Бинарь обновляем при каждом install, если изменился — иначе после
+  # переустановки демон молча жил бы на старом коде (ревью 5.10).
+  if ! cmp -s "$0" "$OXI_HOME/bin/oxi-vpnks" 2>/dev/null; then
+    mkdir -p "$OXI_HOME/bin"
+    cp "$0" "$OXI_HOME/bin/oxi-vpnks" && chmod 755 "$OXI_HOME/bin/oxi-vpnks"
+    chown "${SUDO_USER:-$(stat -f %Su /dev/console 2>/dev/null)}:staff" "$OXI_HOME/bin/oxi-vpnks" 2>/dev/null || true
+  fi
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$OXI_HOME/bin/oxi-vpnks</string><string>guard</string></array>
+  <key>EnvironmentVariables</key><dict><key>OXI_HOME</key><string>$OXI_HOME</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+</dict>
+</plist>
+EOF
+  chown root:wheel "$PLIST"; chmod 644 "$PLIST"
+  # Файлы, созданные под sudo в доме пользователя, возвращаем ему —
+  # иначе `off`/refresh-entries упрётся в permission denied.
+  chown -R "${SUDO_USER:-$(stat -f %Su /dev/console 2>/dev/null)}:staff" "$STATE" "$CONF" 2>/dev/null || true
+  launchctl bootout system "$PLIST" 2>/dev/null
+  launchctl bootstrap system "$PLIST" || { echo "ERROR: launchctl bootstrap" >&2; exit 1; }
+  echo "OK: демон $LABEL установлен и запущен, pf включён."
+  echo "Проверка: $0 status"
+}
+
+do_uninstall() {
+  [ "$(id -u)" -ne 0 ] && { echo "Нужен sudo: sudo $0 uninstall" >&2; exit 1; }
+  launchctl bootout system "$PLIST" 2>/dev/null
+  rm -f "$PLIST"
+  pfctl -a oxi.vpnks -F all 2>/dev/null
+  pfctl -d 2>/dev/null
+  rm -rf "$ETC"
+  echo "OK: демон снят, pf выключен, $ETC удалён. Конфиги в $CONF оставлены."
+}
+
+# --- user-level ---------------------------------------------------------------
+
+do_status() {
+  # --- факты (каждый дешёвый и с таймаутом) ---------------------------------
+  def_if=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $NF; exit}')
+  tun_up=no; case "$def_if" in utun*) tun_up=yes ;; esac
+  incy_app=no; pgrep -x incy >/dev/null 2>&1 && incy_app=yes
+  xray_pid=$(pgrep -f "resources/bin/xray" 2>/dev/null | head -1)
+  ip=$(curl -s -m 4 https://ifconfig.me 2>/dev/null)
+  ip_en0=$(curl -s -m 3 --interface en0 https://ifconfig.me 2>/dev/null)
+  dns_ok=no; dig +time=2 +tries=1 +short example.com >/dev/null 2>&1 && dns_ok=yes
+  mode=on; [ -f "$DISABLED_FLAG" ] && mode=off
+  daemon_up=no; launchctl print "system/$LABEL" >/dev/null 2>&1 && daemon_up=yes
+  lbl=$(awk -v i="$ip" '$1==i{sub(/.*# */,""); print; exit}' "$CONF/entries.txt" 2>/dev/null)
+
+  echo "🛡️  oxi-vpnks — $(date '+%H:%M:%S')"
+
+  # --- гейт -------------------------------------------------------------------
+  if [ "$daemon_up" = yes ]; then
+    pf_note=""
+    if [ -f "$STATE/status" ]; then
+      pf_st=$(sed -n 's/^pf=//p' "$STATE/status")
+      ts=$(sed -n 's/^ts=//p' "$STATE/status")
+      age=$(( $(date +%s) - ${ts:-0} ))
+      [ "$age" -gt 60 ] && pf_note=" ⚠️ статус демона устарел (${age}с)"
+      case "$pf_st" in enforced) pf_note="$pf_note · pf: блок активен" ;; released) pf_note="$pf_note · pf: снят" ;; esac
+    fi
+    if [ "$mode" = off ]; then
+      echo "  Гейт:   🟢 демон работает · режим OFF (блок снят, до ребута)$pf_note"
+    else
+      echo "  Гейт:   🟢 демон работает · режим ON (без VPN держит блок)$pf_note"
+    fi
+  else
+    echo "  Гейт:   ⚪️ демон не установлен/не запущен — sudo $0 install"
+  fi
+
+  # --- INCY и туннель -----------------------------------------------------------
+  incy_txt="🔴 не запущен"; [ "$incy_app" = yes ] && incy_txt="🟢 приложение"
+  if [ -n "$xray_pid" ]; then
+    xr_up=$(ps -p "$xray_pid" -o etime= 2>/dev/null | tr -d ' ')
+    incy_txt="$incy_txt · 🟢 ядро xray (работает ${xr_up:-?})"
+  else
+    incy_txt="$incy_txt · ⚪️ ядро xray не запущено"
+  fi
+  echo "  INCY:   $incy_txt"
+  if [ "$tun_up" = yes ]; then
+    if [ -f "$STATE/tun_health" ]; then
+      th=$(awk '{print $1}' "$STATE/tun_health"); tht=$(awk '{print $2}' "$STATE/tun_health")
+      ths=$(date -r "${tht:-0}" '+%H:%M' 2>/dev/null)
+      case "$th" in
+        heal-failed) echo "  Туннель: 🔴 МЁРТВ с $ths, авто-лечение исчерпано — нужен ручной разбор (через $def_if)" ;;
+        *)           echo "  Туннель: 🔴 маршрут через $def_if есть, но трафик не идёт (с $ths) — лечится рестартом INCY" ;;
+      esac
+    else
+      echo "  Туннель: 🟢 поднят (default route → $def_if)"
+    fi
+  else
+    echo "  Туннель: ⚪️ не подключён (default route → ${def_if:-не найден})"
+  fi
+
+  # --- сеть: куда реально идёт трафик -------------------------------------------
+  if [ -n "$ip" ]; then
+    if [ "$tun_up" = yes ] && [ -n "$lbl" ]; then
+      echo "  Трафик: 🟢 через VPN → $lbl ($ip)"
+    elif [ "$tun_up" = yes ]; then
+      echo "  Трафик: 🟡 через туннель, но выход $ip не из реестра — проверь выбранный сервер в INCY"
+    elif [ "$ip" = "$ip_en0" ] || [ -n "$ip_en0" ]; then
+      echo "  Трафик: ⚪️ напрямую, без VPN (выход $ip — IP этой сети)"
+    else
+      echo "  Трафик: 🟡 напрямую (выход $ip)"
+    fi
+  else
+    echo "  Трафик: 🔴 наружу не ходит"
+  fi
+  if [ "$dns_ok" = yes ]; then
+    echo "  DNS:    🟢 резолв работает"
+  else
+    echo "  DNS:    🔴 НЕ резолвится — сайты не откроются даже при живом туннеле"
+  fi
+  [ -f "$STATE/breakglass.active" ] && echo "  🚑 break-glass: tg + BB идут напрямую через en0 (туннель мёртв)"
+
+  # --- последние события guard (что делал сам) -----------------------------------
+  if [ -f "$LOG" ]; then
+    ev=$(grep -E "TUNNEL DEAD|туннель ожил|HEAL|рестарт INCY|LEAK|включаю блок|блок снят|простой" "$LOG" 2>/dev/null | tail -3)
+    if [ -n "$ev" ]; then
+      echo "  Guard:"
+      echo "$ev" | sed 's/^/    /'
+    fi
+  fi
+
+  # --- вердикт: одно понятное предложение, что происходит и ждать ли -------------
+  echo "  ─────────────────────────────────────"
+  if [ "$daemon_up" != yes ]; then
+    echo "  Вердикт: гейт не работает — всё зависит от INCY вручную."
+  elif [ "$tun_up" = yes ] && [ -n "$lbl" ] && [ "$dns_ok" = yes ]; then
+    echo "  Вердикт: ✅ всё в порядке — трафик идёт через VPN ($lbl). Ждать ничего не надо."
+  elif [ "$tun_up" = yes ] && [ "$dns_ok" = no ]; then
+    if [ "$mode" = on ]; then
+      echo "  Вердикт: ⚠️ туннель поднят, но DNS мёртв (типично после смены сети). Guard заметит и перезапустит INCY сам — дай ему до 15 мин, или перезапусти INCY руками."
+    else
+      echo "  Вердикт: ⚠️ туннель поднят, но DNS мёртв (типично после смены сети). Блок OFF — самолечение выключено: перезапусти INCY руками или верни блок (oxi-vpnks on)."
+    fi
+  elif [ "$tun_up" = yes ]; then
+    echo "  Вердикт: ⚠️ туннель поднят, но выхода через него нет — рестарт INCY."
+  elif [ -z "$ip" ]; then
+    if [ "$mode" = on ]; then
+      echo "  Вердикт: ⚠️ VPN не подключён, гейт держит блок — наружу всё закрыто, это ожидаемо. Подними INCY; если INCY «включён», а туннеля нет — рестарт INCY."
+    else
+      echo "  Вердикт: 🔴 интернета нет вообще (и напрямую тоже) — проблема сети/WiFi, не VPN и не блок: проверь wifi/кабель/роутер."
+    fi
+  elif [ "$mode" = on ]; then
+    echo "  Вердикт: ⚪️ VPN не подключён, трафик пока напрямую. Гейт в режиме ON закроет его блоком — подними INCY."
+  else
+    echo "  Вердикт: ⚪️ VPN не подключён, трафик напрямую, блок OFF. Включай INCY, когда нужно."
+  fi
+}
+
+case "${1:-status}" in
+  install)   do_install ;;
+  uninstall) do_uninstall ;;
+  on)        rm -f "$DISABLED_FLAG"; echo "ON: демон включит pf за ≤10 c" ;;
+  off)       : > "$DISABLED_FLAG"; echo "OFF: демон выключит pf за ≤10 c (до ребута/рестарта демона)" ;;
+  status)    do_status ;;
+  guard)     do_guard ;;
+  apply)     do_apply ;;
+  refresh-entries)
+    python3 - "$CONF/entries.txt" <<'EOF'
+import sys, yaml
+# Источник истины — main (PR #12 влит 2026-10-05).
+try:
+    d = yaml.safe_load(open('/Users/oxi/vpn-data/registry/registry/servers.yaml'))['servers']
+    lines = [f"{s['host']}\t# {s['id']}" for s in d if s.get('enabled') and s.get('host')]
+    open(sys.argv[1], 'w').write("# Адреса входов VPN (из реестра, обновлено)\n" + "\n".join(lines) + "\n")
+    print(f"entries.txt обновлён: {len(lines)} входов")
+except Exception as e:
+    print(f"ошибка: {e}", file=sys.stderr); sys.exit(1)
+EOF
+    ;;
+  *) echo "usage: oxi-vpnks {install|uninstall|on|off|status|refresh-entries}" >&2; exit 64 ;;
+esac

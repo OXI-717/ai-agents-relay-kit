@@ -1,0 +1,4 @@
+users:
+  - { id: alice, name: Алиса, admin: true, status: active, routing: default-ru, formats: [incy, happ] }
+  - { id: bob, name: Боб, status: active, routing: default-ru, entries: [kz], formats: [incy] }
+  - { id: carol, name: Кэрол, status: revoked, routing: default-ru, formats: [incy] }

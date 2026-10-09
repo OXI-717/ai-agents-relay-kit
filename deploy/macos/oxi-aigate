@@ -1,0 +1,182 @@
+#!/bin/bash
+# oxi-aigate — блокировка AI-приложений, когда VPN выключен.
+# Уровень ПРИЛОЖЕНИЙ, не сети: интернет работает весь, а AI-сервисы
+# (chatgpt/claude/perplexity/…) не резолвятся. Реализация — маркированный
+# блок в /etc/hosts: VPN down → блок стоит, VPN up (default route на utun*)
+# → блок снят. Для семейных ноутбуков: дети смотрят мультики свободно,
+# но codex/chatgpt/claude без VPN мертвы.
+#
+# Субкоманды:
+#   install    (sudo) поставить LaunchDaemon и включить
+#   uninstall  (sudo) снять демон и убрать блок из /etc/hosts
+#   status     показать состояние
+#   guard      (root, из LaunchDaemon) цикл поддержки
+#
+# Лог: ~/.local/state/aigate/guard.log
+
+set -u
+# Демон под launchd без HOME: дом прибиваем (env OXI_HOME из plist → SUDO_USER → HOME)
+OXI_HOME="${OXI_HOME:-${SUDO_USER:+$(eval echo "~$SUDO_USER")}}"
+OXI_HOME="${OXI_HOME:-${HOME:-/Users/oxi}}"
+STATE="$OXI_HOME/.local/state/aigate"
+CONF="$OXI_HOME/.config/oxi-aigate"
+PLIST=/Library/LaunchDaemons/com.oxi.aigate.plist
+LABEL=com.oxi.aigate
+LOG="$STATE/guard.log"
+HOSTS=/etc/hosts
+BEGIN="# oxi-aigate:begin"
+END="# oxi-aigate:end"
+
+# AI-сервисы (дополнительные — $CONF/domains.txt, по одному на строку).
+# hosts не умеет wildcard — ключевые поддомены явно.
+AI_DOMAINS="chatgpt.com www.chatgpt.com auth.openai.com api.openai.com openai.com www.openai.com oaistatic.com www.oaistatic.com oaiusercontent.com www.oaiusercontent.com claude.ai www.claude.ai api.claude.ai anthropic.com www.anthropic.com api.anthropic.com perplexity.ai www.perplexity.ai api.perplexity.ai pplx.ai www.pplx.ai"
+
+mkdir -p "$STATE" "$CONF"
+
+vpn_is_up() {
+  local def_if
+  def_if=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $NF; exit}')
+  # utun (INCY/Happ/Tailscale), ipsec/ppp (IKEv2/L2TP)
+  [ "${def_if#utun}" != "$def_if" ] || [ "${def_if#ipsec}" != "$def_if" ] || [ "${def_if#ppp}" != "$def_if" ]
+}
+
+# Лок на hosts-правки: без него uninstall (del) параллельно с guard (add)
+# давал дублирующий BEGIN-блок, а старый del снимал только первую пару
+# маркеров — сиротский блок оставался в hosts навсегда (ревью 5.10).
+LOCK="$STATE/lock"
+lock_hosts()   { while ! mkdir "$LOCK" 2>/dev/null; do sleep 0.2; done; }
+unlock_hosts() { rmdir "$LOCK" 2>/dev/null; }
+
+block_present() { grep -qF "$BEGIN" "$HOSTS"; }
+
+add_block() {
+  lock_hosts
+  if block_present; then unlock_hosts; return 0; fi
+  {
+    echo "$BEGIN"
+    # v4 И v6: без ::1 AAAA-запросы уходят мимо hosts в настоящий DNS —
+    # chatgpt.com резолвился по IPv6 даже при стоящем блоке (Air, 5.10).
+    for d in $AI_DOMAINS $(grep -vE '^\s*(#|$)' "$CONF/domains.txt" 2>/dev/null); do
+      echo "0.0.0.0 $d"
+      echo "::1 $d"
+    done
+    echo "$END"
+  } >> "$HOSTS"
+  unlock_hosts
+  killall -HUP mDNSResponder 2>/dev/null
+}
+
+del_block() {
+  lock_hosts
+  if ! block_present; then unlock_hosts; return 0; fi
+  # Атомарно: фильтруем во временный файл рядом с hosts и переименовываем.
+  # Старый вариант `cat tmp > hosts` на прерывании оставлял пустой hosts.
+  local tmp
+  if ! tmp=$(mktemp /etc/hosts.aigate.XXXXXX); then
+    echo "$(date '+%F %T') ERROR: del_block: mktemp в /etc не удался — hosts не тронут" >&2
+    unlock_hosts
+    return 1
+  fi
+  if awk -v b="$BEGIN" -v e="$END" '$0==b{skip=1;next} $0==e{skip=0;next} !skip{print}' "$HOSTS" > "$tmp" \
+     && [ -s "$tmp" ]; then
+    chmod 644 "$tmp"; chown root:wheel "$tmp" 2>/dev/null
+    mv -f "$tmp" "$HOSTS"
+  else
+    echo "$(date '+%F %T') ERROR: del_block не смог собрать hosts — hosts не тронут" >&2
+    rm -f "$tmp"
+    unlock_hosts
+    return 1
+  fi
+  unlock_hosts
+  killall -HUP mDNSResponder 2>/dev/null
+}
+
+do_guard() {
+  exec >>"$LOG" 2>&1
+  echo "$(date '+%F %T') aigate start (pid $$)"
+  local last_beat=0
+  while true; do
+    if vpn_is_up; then
+      if block_present; then
+        del_block && echo "$(date '+%F %T') VPN поднялся — AI-блок снят"
+      fi
+    else
+      if ! block_present; then
+        add_block && echo "$(date '+%F %T') нет VPN — AI-блок включён"
+      fi
+    fi
+    local now; now=$(date +%s)
+    if [ $((now - last_beat)) -ge 3600 ]; then
+      echo "$(date '+%F %T') alive: block=$(block_present && echo on || echo off)"
+      last_beat=$now
+    fi
+    sleep 10
+  done
+}
+
+do_install() {
+  [ "$(id -u)" -ne 0 ] && { echo "Нужен sudo: sudo $0 install" >&2; exit 1; }
+  # Бинарь обновляем при каждом install, если изменился — иначе после
+  # переустановки демон молча жил бы на старом коде (ревью 5.10).
+  if ! cmp -s "$0" "$OXI_HOME/bin/oxi-aigate" 2>/dev/null; then
+    mkdir -p "$OXI_HOME/bin"
+    cp "$0" "$OXI_HOME/bin/oxi-aigate" && chmod 755 "$OXI_HOME/bin/oxi-aigate"
+    chown "${SUDO_USER:-$(stat -f %Su /dev/console 2>/dev/null)}:staff" "$OXI_HOME/bin/oxi-aigate" 2>/dev/null || true
+  fi
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$OXI_HOME/bin/oxi-aigate</string><string>guard</string></array>
+  <key>EnvironmentVariables</key><dict><key>OXI_HOME</key><string>$OXI_HOME</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+</dict>
+</plist>
+EOF
+  chown root:wheel "$PLIST"; chmod 644 "$PLIST"
+  chown -R "${SUDO_USER:-oxi}:staff" "$STATE" "$CONF" 2>/dev/null || true
+  launchctl bootout system "$PLIST" 2>/dev/null
+  launchctl bootstrap system "$PLIST" || { echo "ERROR: launchctl bootstrap" >&2; exit 1; }
+  echo "OK: демон $LABEL установлен. AI-блок встанет при выключенном VPN за ≤10 с."
+}
+
+do_uninstall() {
+  [ "$(id -u)" -ne 0 ] && { echo "Нужен sudo: sudo $0 uninstall" >&2; exit 1; }
+  launchctl bootout system "$PLIST" 2>/dev/null
+  rm -f "$PLIST"
+  del_block
+  echo "OK: демон снят, AI-блок убран из /etc/hosts."
+}
+
+do_status() {
+  echo "🤖 OXI AI-БЛОКИРОВКА (уровень приложений):"
+  if launchctl print "system/$LABEL" >/dev/null 2>&1; then
+    echo "  🟢 Демон: запущен"
+  else
+    echo "  ⚪️ Демон: не установлен — установка: sudo $0 install"
+  fi
+  def_if=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $NF; exit}')
+  if [ "${def_if#utun}" != "$def_if" ]; then
+    echo "  🟢 VPN: поднят ($def_if) — AI открыт"
+  else
+    echo "  🔴 VPN: нет — AI заблокирован"
+  fi
+  if block_present; then
+    n=$(awk -v b="$BEGIN" -v e="$END" '$0==b{f=1;next} $0==e{f=0;next} f&&$1=="0.0.0.0"{n++} END{print n+0}' "$HOSTS")
+    echo "  🔒 /etc/hosts: блок стоит ($n доменов, v4+v6)"
+  else
+    echo "  🔓 /etc/hosts: блока нет"
+  fi
+}
+
+case "${1:-status}" in
+  install)   do_install ;;
+  uninstall) do_uninstall ;;
+  status)    do_status ;;
+  guard)     do_guard ;;
+  *) echo "usage: oxi-aigate {install|uninstall|status}" >&2; exit 64 ;;
+esac
